@@ -7,6 +7,7 @@
 
 #include"UnitMemory_Profile.h"
 
+
 //获取路径中最后的文件名。
 static string GetFileName(const string& path)
 {
@@ -25,14 +26,21 @@ static string GetFileName(const string& path)
 
 void ResourceInfo::Update(double value)
 {
+	//printf("value=%lf\n",value);
 	// value < 0时则直接返回不再更新。
-	if (value < 0)
+	if (value > -1e-6 && value < 1e-6)
 		return;
-
+  
 	if (value > _peak)
-		_peak = value;
-    if(value < _small)
-		_small = value;
+	_peak = value;
+	if(_count==0)
+	{
+     _small = value;
+	}else if(value < _small)
+	{ 
+	  _small = value;
+	}
+	++_count;
 	// 计算不准确，平均值受变化影响不明显
 	// 需优化，可参考网络滑动窗口反馈调节计算。
 	//_total += value;
@@ -73,12 +81,13 @@ ResourceStatistics::ResourceStatistics()
 
 ResourceStatistics::~ResourceStatistics()
 {
+	pthread_join(_statisticsThread,NULL);
       pthread_cond_destroy(&_condVariable);
 }
 
 void ResourceStatistics::StartStatistics()
 {
-	// 多个线程并行剖析一个代码段的场景下使用引用计数进行统计。
+	// 多个线程并行剖析,ma 一个代码段的场景下使用引用计数进行统计。
 	// 第一个线程进入剖析段时开始统计，最后一个线程出剖析段时
 	// 停止统计。
 	if (_refCount++ == 0)
@@ -126,7 +135,6 @@ void ResourceStatistics::_UpdateStatistics()
 	double cpu = 0.0;
 	double mem = 0.0;
 	sscanf(buf, "%lf %lf", &cpu, &mem);
-
 	_cpuInfo.Update(cpu);
 	_memoryInfo.Update(mem);
 }
@@ -199,10 +207,10 @@ void PerformanceProfilerSection::Serialize(SaveAdapter& SA)
 	if (_rsStatistics)
 	{
 		ResourceInfo cpuInfo = _rsStatistics->GetCpuInfo();
-		SA.Save("[Cpu] Peak:%lf%%, Small:%lf%%\n", cpuInfo._peak, cpuInfo._small);
+		SA.Save("[Cpu] Peak:%f%%, Small:%f%%\n", cpuInfo._peak, cpuInfo._small);
 
 		ResourceInfo memoryInfo = _rsStatistics->GetMemoryInfo();
-		SA.Save("[Memory] Peak:%lf%%, Small:%lf%%\n", memoryInfo._peak, memoryInfo._small);
+		SA.Save("[Memory] Peak:%f%%, Small:%f%%\n", memoryInfo._peak, memoryInfo._small);
 	}
 }
 
@@ -302,7 +310,7 @@ PerformanceProfiler::PerformanceProfiler()
 
 	time(&_beginTime);
 
-	//IPCMonitorServer::GetInstance()->Start();
+	IPCMonitorServer::GetInstance()->Start();
 }
 
 void PerformanceProfiler::OutPut()
@@ -361,6 +369,262 @@ void PerformanceProfiler::_OutPut(SaveAdapter& SA)
 		SA.Save("\n");
 	}
 
+    SA.Save("Profiler end Time: %s\n", ctime(&_beginTime));
 	SA.Save("==========================end========================\n\n");
 }
 
+
+// 内存块剖析信息类的构造函数实现
+MemoryBlockInfo::MemoryBlockInfo(const char* type, int num, size_t size,
+	void * ptr, const char* filename, int fileline)
+	: _type(type)
+	, _ptr(ptr)
+	, _num(num)
+	, _size(size)
+	, _filename(GetFileName(filename))
+	, _fileline(fileline)
+{}
+/*
+////////////////////////////////////////
+// 内存剖析类中函数的实现
+////////////////////////////////////////
+*/
+// 添加记录
+void MemoryAnalyse::AddRecord(const MemoryBlockInfo& memBlockInfo)
+{
+	int flag = ConfigManager::GetInstance()->GetOptions();
+	if (flag == CO_NONE)
+		return;
+
+	void* ptr = memBlockInfo._ptr;
+	const string& type = memBlockInfo._type;
+	const size_t& size = memBlockInfo._size;
+
+	Lock lock(_mutex);
+
+	// 更新内存泄露块记录
+	if (flag & CO_ANALYSE_MEMORY_LEAK)
+	{
+		_leakBlockMap[ptr] = memBlockInfo;
+	}
+
+	// 更新内存热点记录
+	if (flag & CO_ANALYSE_MEMORY_HOT)
+	{
+		_hostObjectMap[type].AddCount(memBlockInfo._size);
+	}
+	// 更新内存块分配信息(内存块记录&分配计数)
+	if (flag & CO_ANALYSE_MEMORY_ALLOC_INFO)
+	{
+		_memBlcokInfos.push_back(memBlockInfo);
+
+		_allocCountInfo.AddCount(size);
+	}
+}
+// 删除记录
+void MemoryAnalyse::DelRecord(const MemoryBlockInfo& memBlockInfo)
+{
+	// 获取配置信息
+	int flag = ConfigManager::GetInstance()->GetOptions();
+	if (flag == CO_NONE)
+		return;
+
+	void* ptr = memBlockInfo._ptr;
+	const string& type = memBlockInfo._type;
+	const size_t& size = memBlockInfo._size;
+
+	Lock lock(_mutex);
+
+	// 更新内存泄露块记录
+	if (flag & CO_ANALYSE_MEMORY_LEAK)
+	{
+		MemoryLeakMap::iterator it = _leakBlockMap.find(ptr);
+		if (it != _leakBlockMap.end())
+		{
+			_leakBlockMap.erase(it);
+		}
+		else
+		{
+			perror("【Leak】Record Memory Block No Match");
+		}
+	}
+
+	// 更新内存热点记录
+	if (flag & CO_ANALYSE_MEMORY_HOT)
+	{
+		MemoryHostMap::iterator it = _hostObjectMap.find(type);
+		if (it != _hostObjectMap.end())
+		{
+			it->second.DelCount(size);
+		}
+		else
+		{
+			perror("【host】Record Memory Block No Match");
+		}
+	}
+
+	// 更新内存块分配计数
+	if (flag & CO_ANALYSE_MEMORY_ALLOC_INFO)
+	{
+		_allocCountInfo.DelCount(memBlockInfo._size);
+	}
+}
+// 输出剖析结果到对应的配置器
+void MemoryAnalyse::_OutPut(SaveAdapter& SA)
+{
+	int flag = ConfigManager::GetInstance()->GetOptions();
+
+	SA.Save("---------------------------【Analyse Report】---------------------------\r\n");
+
+	if (flag & CO_ANALYSE_MEMORY_LEAK)
+	{
+		_OutPutLeakBlockInfo(SA);
+	}
+	if (flag & CO_ANALYSE_MEMORY_HOT)
+	{
+		_OutPutHostObjectInfo(SA);
+	}
+	if (flag & CO_ANALYSE_MEMORY_ALLOC_INFO)
+	{
+		_OutPutAllBlockInfo(SA);
+	}
+
+	SA.Save("-----------------------------【   end   】----------------------------\r\n");
+}
+
+void MemoryAnalyse::_OutPutLeakBlockInfo(SaveAdapter& SA)
+{
+	//SA.Save(BEGIN_LINE);
+	{
+		Lock lock(_mutex);
+
+		if (!_leakBlockMap.empty())
+		{
+			SA.Save("\r\n【Memory Leak Block Info】\r\n");
+		}
+
+		int index = 1;
+		MemoryLeakMap::iterator it = _leakBlockMap.begin();
+		for (; it != _leakBlockMap.end(); ++it)
+		{
+			SA.Save("NO%d.\r\n", index++);
+			it->second.Serialize(SA);
+		}
+	}
+
+	//SA.Save(BEGIN_LINE);
+}
+
+void MemoryAnalyse::_OutPutHostObjectInfo(SaveAdapter& SA)
+{
+	//SA.Save(BEGIN_LINE);
+
+	// 对热点信息进行排序的比较器
+	struct CompareHostInfo
+	{
+		bool operator() (MemoryHostMap::iterator lhs, MemoryHostMap::iterator rhs)
+		{
+			return lhs->second._totalSize > rhs->second._totalSize;//热点信息各类型之间总大小进行排序
+		}
+	};
+	std::vector<MemoryHostMap::iterator> vHostInofs; //存储迭代器的vector
+
+	{
+		Lock lock(_mutex);
+		MemoryHostMap::iterator it = _hostObjectMap.begin();
+		for (; it != _hostObjectMap.end(); ++it)
+		{
+			vHostInofs.push_back(it);
+		}
+	}
+
+	if(!vHostInofs.empty())
+	{
+		SA.Save("\r\n【Memory Host Object Statistics】\r\n");
+	}
+	// 对热点类型按分配的大小进行排序，总大小大的排在前面输出
+	//sort(vHostInofs.begin(), vHostInofs.end(), CompareHostInfo());	
+	int index = 0;
+	for (;index < vHostInofs.size(); ++index)
+	{
+		SA.Save("NO%d.\r\n", index + 1);
+		SA.Save("type:%s , ", vHostInofs[index]->first.c_str());
+		vHostInofs[index]->second.Serialize(SA);
+	}
+
+	//SA.Save(BEGIN_LINE);
+}
+
+void MemoryAnalyse::_OutPutAllBlockInfo(SaveAdapter& SA)
+{
+	if (_memBlcokInfos.empty())
+		return;
+
+	//SA.Save(BEGIN_LINE);
+
+	{
+		Lock lock(_mutex);
+
+		SA.Save("\r\n【Alloc Count Statistics】\r\n");
+		_allocCountInfo.Serialize(SA);
+
+		SA.Save("\r\n【All Memory Blcok Info】\r\n");
+		int index = 1;
+		MemoryBlcokInfos::iterator it = _memBlcokInfos.begin();
+		for (; it != _memBlcokInfos.end(); ++it)
+		{
+			SA.Save("NO%d.\r\n", index++);
+			it->Serialize(SA);
+		}
+	}
+
+	//SA.Save(BEGIN_LINE);
+}
+
+MemoryAnalyse::MemoryAnalyse()
+{
+	atexit(OutPut);
+}
+
+/*
+////////////////////////////////////////
+// 内存管理类类中函数的实现
+////////////////////////////////////////
+*/
+//内存管理类构造函数
+MemoryManager::MemoryManager()
+{
+	// 如果调用了MemoryManager，则开启在线控制服务
+	// ps：这里会导致动态库卡死，需改进。
+	//IPCMonitorServer::GetInstance()->Start();
+}
+// 申请内存/更新剖析信息
+void* MemoryManager::Alloc(const char* type, size_t size, int num,
+	const char* filename, int fileline)
+{
+	void* ptr = _allocPool.allocate(size);
+
+	if (ConfigManager::GetInstance()->GetOptions() != CO_NONE)
+	{
+		// 数组对象多分配了4个字节存储对象个数，不计入统计剖析
+		size_t realSize = num > 1 ? size - 4 : size;
+		MemoryBlockInfo info(type, num, realSize, ptr, filename, fileline);
+		MemoryAnalyse::GetInstance()->AddRecord(info);
+	}
+
+	return ptr;
+}
+// 释放内存/更新剖析信息
+void MemoryManager::Dealloc(const char* type, void* ptr, size_t size)
+{
+	if (ptr)
+	{
+		_allocPool.deallocate((char*)ptr, size);
+
+		if (ConfigManager::GetInstance()->GetOptions() != CO_NONE)
+		{
+			MemoryBlockInfo info(type, 0, size, ptr);
+			MemoryAnalyse::GetInstance()->DelRecord(info);
+		}
+	}
+}

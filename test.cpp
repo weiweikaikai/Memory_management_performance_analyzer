@@ -21,12 +21,13 @@ using namespace std;
 */
 
 
+
 // 1.测试基本功能
 void Test1()
 {
 	PERFORMANCE_PROFILER_BEGIN(PP1, "PP1");
     
-	sleep(1);
+	sleep(30);
 	PERFORMANCE_PROFILER_END(PP1);
 
 	PERFORMANCE_PROFILER_BEGIN(PP2, "PP2");
@@ -42,6 +43,7 @@ void Test2()
     
 	int *p = new int(10000);
 	delete p;
+	sleep(30);
 	PERFORMANCE_PROFILER_AND_RS_END(PP1);
 
 	PERFORMANCE_PROFILER_AND_RS_BEGIN(PP2, "PP2");
@@ -56,8 +58,8 @@ int main()
 {
 
   SET_OPTIONS(PPCO_PROFILER | PPCO_SAVE_TO_CONSOLE);
-  //Test1();
-  Test2();
+  Test1();
+  //Test2();
 return 0;
 }
 
